@@ -1,0 +1,169 @@
+name: build-lhhc
+
+# 在 GitHub 云端把官方 MU300 OpenWrt(openwrt-luci) rootfs 重新组装成带插件的固件。
+# 不编译内核：直接复用官方 rootfs 里的 5.4 厂商内核模块，只改用户空间。
+# 产物：mu300-openwrt-luci-<署名字段>-rootfs.tar.gz（F50 刷机助手「本地 rootfs」可直接选）
+
+on:
+  workflow_dispatch:
+    inputs:
+      mu300_release:
+        description: 'MU300 上游 release tag（须与刷机助手内置内核包一致，1.8.6 为 v2026.10.17）'
+        required: true
+        default: 'v2026.10.17'
+      lhhc_tag:
+        description: '个人署名字段（写进固件版本、SSH banner、/etc/mu300/lhhc-build）'
+        required: true
+        default: 'lhhc_02'
+      with_mihomo_core:
+        description: '预置 mihomo 内核（OpenClash 开箱可用）'
+        type: choice
+        options: ['yes', 'no']
+        default: 'yes'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: assemble-rootfs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: 取仓库文件
+        uses: actions/checkout@v4
+
+      - name: 统一 LF 换行
+        run: |
+          set -euo pipefail
+          find scripts -type f -print0 | xargs -0 -r sed -i 's/\r$//'
+          chmod +x scripts/in-image.sh
+          head -n 1 scripts/in-image.sh
+
+      - name: 注册 qemu arm64
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: 解析上游版本
+        id: rel
+        run: |
+          set -euo pipefail
+          TAG='${{ inputs.mu300_release }}'
+          case "$TAG" in
+            latest|'')
+              TAG=$(curl -fsSL https://api.github.com/repos/dikeckaan/mu300-linux/releases/latest \
+                    | python3 -c 'import json,sys;print(json.load(sys.stdin)["tag_name"])')
+              ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "上游版本: $TAG"
+
+      - name: 下载基础 rootfs 并校验
+        run: |
+          set -euo pipefail
+          TAG='${{ steps.rel.outputs.tag }}'
+          BASE="https://github.com/dikeckaan/mu300-linux/releases/download/$TAG"
+          mkdir -p assets out
+          curl -fL --retry 5 --retry-delay 3 -o assets/base-rootfs.tar.gz "$BASE/mu300-openwrt-luci-rootfs.tar.gz"
+          curl -fL --retry 5 --retry-delay 3 -o assets/SHA256SUMS "$BASE/SHA256SUMS" || true
+          if [ -s assets/SHA256SUMS ]; then
+            want=$(grep -E ' \*?mu300-openwrt-luci-rootfs\.tar\.gz$' assets/SHA256SUMS | awk '{print $1}' | head -n1)
+            have=$(sha256sum assets/base-rootfs.tar.gz | awk '{print $1}')
+            echo "官方 sha256: ${want:-（无）}"
+            echo "实际 sha256: $have"
+            if [ -n "$want" ] && [ "$have" != "$want" ]; then
+              echo "::error::基础 rootfs SHA256 校验失败"
+              exit 1
+            fi
+          fi
+          ls -la assets
+
+      - name: 下载插件资产
+        run: |
+          set -euo pipefail
+          api_json() { curl -fsSL -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$1/releases/latest"; }
+
+          # ---- OpenClash：官方 .apk ----
+          OC_JSON=$(api_json vernesong/OpenClash)
+          OC_TAG=$(printf '%s' "$OC_JSON" | jq -r .tag_name)
+          OC_URL=$(printf '%s' "$OC_JSON" | jq -r '[.assets[] | select(.name|endswith(".apk"))][0].browser_download_url // empty')
+          [ -n "$OC_URL" ] || { echo "::error::OpenClash 最新版没有 .apk 资产"; exit 1; }
+          curl -fL --retry 5 -o assets/luci-app-openclash.apk "$OC_URL"
+          echo "OpenClash $OC_TAG <- $OC_URL"
+
+          # ---- lucky：静态 arm64 ----
+          LK_JSON=$(api_json gdy666/lucky)
+          LK_TAG=$(printf '%s' "$LK_JSON" | jq -r .tag_name)
+          LK_URL=$(printf '%s' "$LK_JSON" | jq -r '[.assets[] | select(.name|test("Linux_arm64\\.tar\\.gz$"))][0].browser_download_url // empty')
+          [ -n "$LK_URL" ] || { echo "::error::lucky 最新版没有 Linux_arm64 资产"; exit 1; }
+          curl -fL --retry 5 -o assets/lucky.tar.gz "$LK_URL"
+          tar -tzf assets/lucky.tar.gz | grep -qx 'lucky' || { echo "::error::lucky 包结构异常"; exit 1; }
+          echo "lucky $LK_TAG <- $LK_URL"
+
+          # ---- mihomo 内核 ----
+          if [ '${{ inputs.with_mihomo_core }}' = 'yes' ]; then
+            MH_JSON=$(api_json MetaCubeX/mihomo)
+            MH_TAG=$(printf '%s' "$MH_JSON" | jq -r .tag_name)
+            MH_URL=$(printf '%s' "$MH_JSON" | jq -r '[.assets[] | select(.name|test("^mihomo-linux-arm64-.*\\.gz$")) | select(.name|test("compatible")|not)][0].browser_download_url // empty')
+            [ -n "$MH_URL" ] || { echo "::error::mihomo 没有 arm64 gz 资产"; exit 1; }
+            curl -fL --retry 5 -o assets/mihomo.gz "$MH_URL"
+            echo "mihomo $MH_TAG <- $MH_URL"
+          fi
+
+          cp scripts/lucky-init.d assets/lucky-init.d
+          ls -la assets
+
+      - name: 导入基础镜像
+        run: |
+          set -euo pipefail
+          docker import --platform linux/arm64 assets/base-rootfs.tar.gz mu300-lhhc-base:local
+          docker image inspect mu300-lhhc-base:local --format '已导入 {{.Os}}/{{.Architecture}}'
+
+      - name: 容器内加装插件并打包
+        run: |
+          set -euo pipefail
+          TAG='${{ steps.rel.outputs.tag }}'
+          LHHC='${{ inputs.lhhc_tag }}'
+          OUT="mu300-openwrt-luci-${LHHC}-rootfs.tar.gz"
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+          if [ '${{ inputs.with_mihomo_core }}' = 'yes' ]; then CORE=1; else CORE=0; fi
+          docker run --rm --platform linux/arm64 \
+            -e LHHC_TAG="$LHHC" \
+            -e UPSTREAM_RELEASE="$TAG" \
+            -e OUT="$OUT" \
+            -e WITH_CORE="$CORE" \
+            -v "$PWD/scripts/in-image.sh:/in-image.sh:ro" \
+            -v "$PWD/assets:/assets:ro" \
+            -v "$PWD/out:/out" \
+            mu300-lhhc-base:local /bin/sh /in-image.sh
+
+      - name: 产物自检
+        run: |
+          set -euo pipefail
+          T=$(ls out/*.tar.gz | head -n1)
+          echo "产物: $T  大小: $(du -h "$T" | cut -f1)"
+          tar -tzf "$T" > /tmp/members.txt
+          echo "归档成员数: $(wc -l < /tmp/members.txt)"
+          for f in ./sbin/init ./opt/mu300/bin/mu300-next-boot ./opt/mu300/bin/mobile-data \
+                   ./usr/share/rpcd/acl.d/luci-app-mu300.json ./etc/openwrt_release \
+                   ./usr/bin/lucky ./etc/init.d/lucky ./etc/init.d/openclash ./etc/mu300/lhhc-build; do
+            grep -qx "$f" /tmp/members.txt || { echo "::error::缺少 $f"; exit 1; }
+          done
+          n6=$(grep -c '^./lib/modules/6\.' /tmp/members.txt || true)
+          echo "残留 6.x 内核模块条目: ${n6:-0}（应为 0）"
+          mkdir -p /tmp/x && tar -xzf "$T" -C /tmp/x ./etc/openwrt_release ./etc/mu300/lhhc-build ./etc/banner
+          echo '---- /etc/openwrt_release ----'; cat /tmp/x/etc/openwrt_release
+          echo '---- /etc/mu300/lhhc-build ----'; cat /tmp/x/etc/mu300/lhhc-build
+          echo '---- /etc/banner ----'; cat /tmp/x/etc/banner
+          sha256sum "$T" | tee "$T.sha256"
+
+      - name: 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: mu300-openwrt-luci-${{ inputs.lhhc_tag }}
+          path: |
+            out/*.tar.gz
+            out/*.sha256
+          compression-level: 0
+          retention-days: 30
